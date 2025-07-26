@@ -24,6 +24,12 @@ class CamFollowNode:
         self.half_rad = 0.7  # 半角弧度
         self.base_w = self.mid_x * 0.6  # 基准框宽度 (像素)
         self.bash_y = 1  # 基准距离 (m)
+        
+        # 障碍检测参数
+        self.obstacle_distance_threshold = 0.50  # 障碍检测距离阈值 (m)
+        self.obstacle_detection_angle = 30  # 前方检测角度范围 (度)
+        self.obstacle_count_threshold = 3  # 连续检测到障碍的次数阈值
+        self.obstacle_recovery_distance = 0.70  # 障碍消失恢复距离 (m)
 
         # 对齐控制参数 - 改进的转向阈值
         self.alignment_tolerance = 15  # 允许的偏差像素，目标在此范围内认为已对齐
@@ -38,7 +44,9 @@ class CamFollowNode:
         self.w_b_min = self.mid_x * 0.8  # 小车后退阈值
         self.w_f_min = self.mid_x * 0.2  # 小车前进阈值
         self.stop_flag = False  # 停止标志
-        self.count = 0
+        self.obstacle_detected = False  # 障碍检测标志
+        self.obstacle_count = 0  # 连续检测到障碍的次数
+        self.min_front_distance = float('inf')  # 当前最小前方距离
 
         # 控制命令
         self.control_speed = 0  # 控制前后速度
@@ -72,29 +80,83 @@ class CamFollowNode:
         else:
             self.process_yolo_results(msg)
         
-    def get_front_distance(self, msg):
+    def get_front_distance_range(self, msg):
         """
-        获取前方距离
+        获取前方扇形区域内的最小距离
         """
         angle_min = msg.angle_min
         angle_increment = msg.angle_increment
         ranges = msg.ranges
-        front_index = int((0 - angle_min) / angle_increment)
-        front_distance = ranges[front_index] if 0 <= front_index < len(ranges) else float('inf')
-        return front_distance
+        
+        # 计算检测角度范围
+        detection_angle_rad = self.obstacle_detection_angle * 3.14159 / 180.0
+        half_angle = detection_angle_rad / 2.0
+        
+        # 计算前方检测区域的索引范围
+        center_index = int((0 - angle_min) / angle_increment)
+        angle_range = int(half_angle / angle_increment)
+        
+        start_index = max(0, center_index - angle_range)
+        end_index = min(len(ranges), center_index + angle_range + 1)
+        
+        # 找到检测区域内的最小距离
+        min_distance = float('inf')
+        valid_readings = 0
+        
+        for i in range(start_index, end_index):
+            if 0 < ranges[i] < 10.0:  # 过滤无效数据
+                min_distance = min(min_distance, ranges[i])
+                valid_readings += 1
+        
+        # 如果没有有效读数，返回无穷大
+        if valid_readings == 0:
+            min_distance = float('inf')
+            
+        return min_distance, valid_readings
+
+    def detect_obstacle(self, min_distance):
+        """
+        检测障碍物并更新停止状态
+        """
+        # 更新最小距离
+        self.min_front_distance = min_distance
+        
+        # 检测障碍物
+        if min_distance <= self.obstacle_distance_threshold and min_distance != float('inf'):
+            self.obstacle_count += 1
+            if self.obstacle_count >= self.obstacle_count_threshold:
+                if not self.obstacle_detected:
+                    rospy.logwarn(f"OBSTACLE DETECTED! Distance: {min_distance:.2f}m - STOPPING ROBOT")
+                self.obstacle_detected = True
+                self.stop_flag = True
+        else:
+            # 检查是否可以恢复
+            if min_distance >= self.obstacle_recovery_distance or min_distance == float('inf'):
+                if self.obstacle_detected:
+                    rospy.loginfo(f"Obstacle cleared! Distance: {min_distance:.2f}m - RESUMING")
+                self.obstacle_detected = False
+                self.stop_flag = False
+                self.obstacle_count = 0
 
     def lidar_callback(self, msg):
         """
-        雷达数据回调函数
+        雷达数据回调函数 - 改进的障碍检测
         """
-        rospy.loginfo("Received Lidar data")
-        front_distance = self.get_front_distance(msg)
-        rospy.loginfo(f"Front distance: {front_distance:.2f} m")
-        if front_distance <= 0.50 and front_distance != 0:
-            rospy.loginfo("Lidar detected obstacle too close, stopping robot.")
-            self.count += 1
-        if self.count > 5:
-            self.stop_flag = True
+        # 获取前方扇形区域的最小距离
+        min_distance, valid_readings = self.get_front_distance_range(msg)
+        
+        # 检测障碍物
+        self.detect_obstacle(min_distance)
+        
+        # 每5次回调打印一次状态信息
+        if hasattr(self, '_lidar_callback_count'):
+            self._lidar_callback_count += 1
+        else:
+            self._lidar_callback_count = 0
+            
+        if self._lidar_callback_count % 5 == 0:
+            status = "OBSTACLE DETECTED" if self.obstacle_detected else "CLEAR"
+            rospy.loginfo(f"Lidar: min_dist={min_distance:.2f}m, readings={valid_readings}, status={status}")
 
     def find_target_rect(self):
         """
@@ -198,15 +260,26 @@ class CamFollowNode:
         """
         根据目标框宽度和距离，计算小车的前进速度
         """
-        if self.w_f_min <= self.target_box_width <= self.w_b_min or self.stop_flag:
-            # 不运动
+        # 优先检查障碍物 - 如果检测到障碍物，立即停止
+        if self.obstacle_detected or self.stop_flag:
+            self.control_speed = 0
+            if self.obstacle_detected:
+                rospy.logwarn(f"Speed blocked by obstacle at {self.min_front_distance:.2f}m")
+            return
+            
+        # 正常的速度控制逻辑
+        if self.w_f_min <= self.target_box_width <= self.w_b_min:
+            # 目标距离合适，不运动
             self.control_speed = 0
         elif self.target_box_width > self.w_b_min:
-            # 后退
+            # 目标太近，后退（但要检查后方是否安全）
+            # 注意：这里可以考虑添加后方障碍检测
             self.control_speed = self.back_speed
         else:
+            # 目标较远，前进
             if self.control_speed <= 0.2:
                 self.control_speed = 0.2
+                
             # 小车前进
             if self.target_center_point <= self.x_l_min or self.target_center_point >= self.x_r_max:
                 pass  # 处于边缘，不让车太快
@@ -218,6 +291,13 @@ class CamFollowNode:
                         self.control_speed += 0.05  # 匀速加速
                 else:
                     self.control_speed = speed
+                    
+            # 根据前方距离调整速度 - 距离越近，速度越慢
+            if self.min_front_distance < 1.5 and self.min_front_distance != float('inf'):
+                distance_factor = max(0.1, (self.min_front_distance - self.obstacle_distance_threshold) / 
+                                    (1.5 - self.obstacle_distance_threshold))
+                self.control_speed *= distance_factor
+                rospy.loginfo(f"Speed reduced due to proximity: factor={distance_factor:.2f}, new_speed={self.control_speed:.2f}")
 
     def shutdown(self):
         """
@@ -245,9 +325,18 @@ class CamFollowNode:
             # 定期打印调试信息
             if current_time - last_log_time > 0.5:  # 每0.5秒打印一次
                 last_log_time = current_time
-                rospy.loginfo(f"Control Speed: {self.control_speed:.2f}, Control Turn: {self.control_turn:.2f}")
+                
+                # 显示控制状态
+                obstacle_status = "BLOCKED" if self.obstacle_detected else "CLEAR"
+                rospy.loginfo(f"=== CONTROL STATUS ===")
+                rospy.loginfo(f"Speed: {self.control_speed:.2f}, Turn: {self.control_turn:.2f}")
+                rospy.loginfo(f"Obstacle: {obstacle_status} (dist: {self.min_front_distance:.2f}m)")
                 if self.rect:
-                    rospy.loginfo(f"Detected {len(self.rect)} targets")
+                    rospy.loginfo(f"Targets detected: {len(self.rect)}")
+                else:
+                    rospy.loginfo("No targets detected")
+                rospy.loginfo("======================")
+                
 
             # 发布控制命令
             twist = Twist()
