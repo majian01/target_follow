@@ -26,9 +26,9 @@ class CamFollowNode:
         self.bash_y = 1  # 基准距离 (m)
 
         # 对齐控制参数 - 改进的转向阈值
-        self.alignment_tolerance = 20  # 允许的偏差像素，目标在此范围内认为已对齐
-        self.turn_gain = 0.5  # 转向增益，控制转向的敏感度
-        self.max_turn_speed = 1.0  # 最大转向速度
+        self.alignment_tolerance = 15  # 允许的偏差像素，目标在此范围内认为已对齐
+        self.turn_gain = 1.0  # 转向增益，控制转向的敏感度 (增大以提高响应)
+        self.max_turn_speed = 0.8  # 最大转向速度 (降低以防止过快转动)
         
         # 原有的转向和前进的阈值
         self.x_l_min = self.mid_x * 0.8  # 向左转向阈值
@@ -151,7 +151,9 @@ class CamFollowNode:
             return
         
         # 计算转向速度，使用比例控制
-        # 负值表示目标在左侧，需要向左转；正值表示目标在右侧，需要向右转
+        # ROS约定: 正值angular.z = 逆时针(左转), 负值angular.z = 顺时针(右转)
+        # error_x > 0: 目标在右侧，需要右转(负的angular.z)
+        # error_x < 0: 目标在左侧，需要左转(正的angular.z)
         turn_speed = -error_x * self.turn_gain / self.mid_x
         
         # 限制最大转向速度
@@ -160,9 +162,19 @@ class CamFollowNode:
         
         self.control_turn = turn_speed
         
-        # 调试信息
+        # 详细调试信息
+        direction = "LEFT" if turn_speed > 0 else "RIGHT"
+        rospy.loginfo(f"=== ALIGNMENT DEBUG ===")
         rospy.loginfo(f"Target center: {self.target_center_point:.2f}, Image center: {self.mid_x:.2f}")
-        rospy.loginfo(f"Error: {error_x:.2f} pixels, Turn speed: {turn_speed:.3f}")
+        rospy.loginfo(f"Error: {error_x:.2f} pixels")
+        rospy.loginfo(f"Turn speed: {turn_speed:.3f} rad/s ({direction})")
+        rospy.loginfo(f"Turn gain: {self.turn_gain}, Max speed: {self.max_turn_speed}")
+        
+        if error_x > 0:
+            rospy.loginfo("Target is on RIGHT side - turning RIGHT (negative angular.z)")
+        else:
+            rospy.loginfo("Target is on LEFT side - turning LEFT (positive angular.z)")
+        rospy.loginfo("=======================") 
 
     def calculate_turn(self):
         """
@@ -242,6 +254,11 @@ class CamFollowNode:
             twist.linear.x = self.control_speed
             twist.angular.z = self.control_turn
             self.vel_pub.publish(twist)
+            
+            # 监控转向命令发送状态
+            if abs(self.control_turn) > 0.01:  # 只在有显著转向时记录
+                turn_direction = "LEFT" if self.control_turn > 0 else "RIGHT"
+                rospy.loginfo(f"PUBLISHING: angular.z = {self.control_turn:.3f} ({turn_direction})")
             
             rate.sleep()
 
